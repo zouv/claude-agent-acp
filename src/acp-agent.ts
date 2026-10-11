@@ -317,7 +317,9 @@ import {
 } from "./session-mode.js";
 import {
   applyAvailableModelsAllowlist,
+  applyExtraModels,
   buildModelConfigOption,
+  extraModelIdsFromMeta,
   getAvailableModels,
   MODEL_CONFIG_ID,
   narrowToGatewayModels,
@@ -342,6 +344,8 @@ import {
 export { EFFORT_CONFIG_ID, settingsEffortForModel } from "./session-effort.js";
 export {
   applyAvailableModelsAllowlist,
+  applyExtraModels,
+  extraModelIdsFromMeta,
   matchResumedModel,
   MODEL_CONFIG_ID,
   resolveModelPreference,
@@ -1647,6 +1651,10 @@ export function computeSessionFingerprint(params: {
       disableBuiltInTools: meta?.disableBuiltInTools,
       emitRawSDKMessages: meta?.claudeCode?.emitRawSDKMessages,
       options,
+      // [CUSTOM] Client-supplied custom models must re-create the query when they
+      // change, so a load/resume with different `_meta.extraModels` rebuilds the
+      // picker instead of reusing the previous session's model list.
+      extraModels: extraModelIdsFromMeta(meta),
     }),
   );
 }
@@ -11150,9 +11158,17 @@ export class ClaudeAcpAgent {
           )
         : settingsAllowedModels;
 
+      // [CUSTOM] Append client-supplied custom models (`_meta.extraModels`) after
+      // the allowlist so a client can offer arbitrary model ids (e.g. gateway
+      // model names) without editing any settings file. See session-model.ts.
+      const modelsWithExtra = applyExtraModels(
+        allowedModels,
+        extraModelIdsFromMeta(params._meta),
+      );
+
       const models = await getAvailableModels(
         q,
-        allowedModels,
+        modelsWithExtra,
         initializationResult.models,
         settingsManager,
         this.logger,

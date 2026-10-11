@@ -591,3 +591,45 @@ export async function getAvailableModels(
     currentModelId: currentModel.value,
   };
 }
+
+// ---------------------------------------------------------------------------
+// [CUSTOM] Client-supplied custom models via `_meta.extraModels`.
+//
+// The stock adapter only ever surfaces models the SDK/CLI already knows. A client
+// that lets the user type arbitrary model ids (e.g. gateway model names) needs a
+// way to append them to the picker without editing any settings file. Mirroring
+// the Universe Editor fork (`XR()` / `h5()`), `_meta.extraModels` carries a list
+// of ids that `applyExtraModels` appends after the normal (allow)list.
+// ---------------------------------------------------------------------------
+
+/** Custom model ids from `_meta.extraModels` (trimmed, deduped, capped at 64). */
+export function extraModelIdsFromMeta(meta: unknown): string[] {
+  const raw = (meta as { extraModels?: unknown } | null | undefined)?.extraModels;
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    if (out.length >= 64) break;
+  }
+  return out;
+}
+
+/**
+ * Append `extraIds` to a model list, skipping ids already present. A synthesized
+ * entry carries the id as its display name, so the client maps it to a friendly
+ * label (the ACP option name is the raw id).
+ */
+export function applyExtraModels(models: ModelInfo[], extraIds: string[]): ModelInfo[] {
+  if (extraIds.length === 0) return models;
+  const out = [...models];
+  for (const id of extraIds) {
+    if (out.some((model) => model.value === id)) continue;
+    out.push({ value: id, displayName: id, description: "" });
+  }
+  return out;
+}

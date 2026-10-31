@@ -24,6 +24,16 @@ alluding to it. Prefer a short concrete example over an abstract description.
 Don't use vague phrases like "keeps it honest" or "the residual case" that make
 the reader reconstruct the meaning.
 
+## Personal information and repository hygiene (hard rule)
+
+- **Never commit**: local absolute paths (`C:\Users\<name>\...`, `/home/<name>/...`), machine or real user names, device identifiers, real names, private email addresses, phone numbers, social accounts, internal company information, secrets / tokens / cookies / private keys, browser profiles, chat logs, user databases, and logs unrelated to the project.
+- **Placeholders and screenshots**: use `C:\path\to\project`, `/home/user/project`, `user@example.com`, `alice` in docs and examples; check image/binary size, remove EXIF / GPS metadata and cover user names, paths, recent projects, and notifications before adding screenshots.
+- **Before commit / push**: keep `git status --porcelain` limited to intended files; use `git grep` to scan for real names, email addresses, user names, local paths, hostnames, and device identifiers; check `git log --format='%an <%ae>%n%cn <%ce>' | sort -u`; keep personal contact details and sensitive context out of commit messages; never commit `.env`, `.runtime/`, logs, caches, or user profiles.
+- **If information leaks**: clean the working tree first; deleting the file is not enough. If it reached Git history (including tags or remotes), back up a bundle and obtain explicit user authorization before rewriting history. Push rewritten history with `--force-with-lease`, update tags, and notify collaborators.
+- The project's own public repository name, package name, copyright holder, upstream source, and public author identity are allowed.
+
+---
+
 ## Pull requests
 
 Squash merges use the PR title as the commit subject, and release-please parses it

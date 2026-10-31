@@ -34,6 +34,12 @@ the reader reconstruct the meaning.
 
 ---
 
+## Branch policy (hard rule)
+
+Develop and commit directly on the main branch; do not create feature or fix branches unless the user explicitly asks.
+
+---
+
 ## Pull requests
 
 Squash merges use the PR title as the commit subject, and release-please parses it

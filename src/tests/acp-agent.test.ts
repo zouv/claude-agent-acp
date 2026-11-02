@@ -27623,3 +27623,173 @@ describe("permission_denied", () => {
     expect(denials(updates)).toHaveLength(1);
   });
 });
+
+describe("full display chain replay", () => {
+  let configDir: string;
+  let originalConfigDir: string | undefined;
+
+  beforeEach(async () => {
+    configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-full-chain-"));
+    originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+  });
+
+  afterEach(async () => {
+    if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+    await rm(configDir, { recursive: true, force: true });
+  });
+
+  const raw = (record: Record<string, unknown>): string => JSON.stringify(record);
+
+  async function writeCompactedTranscript(): Promise<void> {
+    const directory = path.join(configDir, "projects", "-workspace");
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      path.join(directory, "s1.jsonl"),
+      [
+        raw({
+          type: "user",
+          uuid: "u1",
+          parentUuid: null,
+          message: { role: "user", content: [{ type: "text", text: "first question" }] },
+        }),
+        raw({
+          type: "assistant",
+          uuid: "a1",
+          parentUuid: "u1",
+          message: {
+            role: "assistant",
+            id: "m1",
+            content: [{ type: "text", text: "first answer" }],
+          },
+        }),
+        raw({
+          type: "system",
+          subtype: "compact_boundary",
+          uuid: "b1",
+          parentUuid: null,
+          logicalParentUuid: "a1",
+          compactMetadata: { preservedSegment: { tailUuid: "a1" } },
+        }),
+        raw({
+          type: "user",
+          uuid: "s1",
+          parentUuid: "b1",
+          isCompactSummary: true,
+          isVisibleInTranscriptOnly: true,
+          message: {
+            role: "user",
+            content:
+              "This session is being continued from a previous conversation that ran out of context.\n\nSummary:\nsummary body",
+          },
+        }),
+        raw({
+          type: "user",
+          uuid: "u2",
+          parentUuid: "s1",
+          message: { role: "user", content: [{ type: "text", text: "second question" }] },
+        }),
+        raw({
+          type: "assistant",
+          uuid: "a2",
+          parentUuid: "u2",
+          message: {
+            role: "assistant",
+            id: "m2",
+            content: [{ type: "text", text: "second answer" }],
+          },
+        }),
+      ].join("\n") + "\n",
+    );
+  }
+
+  function effectiveChain(): Awaited<ReturnType<typeof getSessionMessages>> {
+    return [
+      {
+        type: "user",
+        uuid: "s1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          role: "user",
+          content:
+            "This session is being continued from a previous conversation that ran out of context.\n\nSummary:\nsummary body",
+        },
+        isCompactSummary: true,
+      },
+      {
+        type: "user",
+        uuid: "u2",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: { role: "user", content: [{ type: "text", text: "second question" }] },
+      },
+      {
+        type: "assistant",
+        uuid: "a2",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          role: "assistant",
+          id: "m2",
+          content: [{ type: "text", text: "second answer" }],
+        },
+      },
+    ] as Awaited<ReturnType<typeof getSessionMessages>>;
+  }
+
+  async function replay(capabilities: ClientCapabilities): Promise<SessionNotification[]> {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, capabilities);
+    agent.sessions.s1 = mockSessionState();
+    vi.mocked(getSessionMessages).mockResolvedValueOnce(effectiveChain());
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+    return updates;
+  }
+
+  const userTexts = (updates: SessionNotification[]): string[] =>
+    updates.flatMap(({ update }) =>
+      update.sessionUpdate === "user_message_chunk" && update.content.type === "text"
+        ? [update.content.text]
+        : [],
+    );
+
+  const compactUpdates = (updates: SessionNotification[]): SessionNotification["update"][] =>
+    updates.flatMap(({ update }) => (update.sessionUpdate === "compaction_update" ? [update] : []));
+
+  it("replays the pre-compaction prompt and emits one compaction update", async () => {
+    await writeCompactedTranscript();
+    const updates = await replay({ session: { compaction: {} } } as ClientCapabilities);
+
+    expect(userTexts(updates)).toEqual(["first question", "second question"]);
+    const compactions = compactUpdates(updates);
+    expect(compactions).toHaveLength(1);
+    expect(compactions[0]).toMatchObject({
+      compactionId: "s1",
+      status: "completed",
+      summary: [{ type: "text", text: "summary body" }],
+    });
+    expect(JSON.stringify(updates)).not.toContain("This session is being continued");
+  });
+
+  it("skips the summary for a client without the compaction contract", async () => {
+    await writeCompactedTranscript();
+    const updates = await replay({});
+
+    expect(userTexts(updates)).toEqual(["first question", "second question"]);
+    expect(compactUpdates(updates)).toEqual([]);
+    expect(JSON.stringify(updates)).not.toContain("This session is being continued");
+  });
+});

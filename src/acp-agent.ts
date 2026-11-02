@@ -248,6 +248,7 @@ import {
   contextCompactionMetadataFromBoundary,
   isCompactSummaryMessage,
 } from "./context-compaction.js";
+import { readFullDisplayChain } from "./transcript-chain.js";
 import {
   clientSupportsNotices,
   MAX_NOTICE_TITLE_LENGTH,
@@ -8750,10 +8751,13 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    const messages = resumedMessages ?? (await getSessionMessages(sessionId));
+    const effectiveMessages = resumedMessages ?? (await getSessionMessages(sessionId));
+    const rebuiltMessages = await readFullDisplayChain(sessionId, effectiveMessages, this.logger);
+    const messages = rebuiltMessages ?? effectiveMessages;
+    const fullChainReplay = rebuiltMessages !== undefined;
     const historyLoadedAt = performance.now();
     this.logger.log(
-      `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
+      `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length} source=${fullChainReplay ? "full-chain" : "effective-chain"}`,
     );
     // A pending replay has no session record yet. It uses the state that the record takes later.
     const replayState = (): ReplayState | undefined => pending?.state ?? this.sessions[sessionId];
@@ -9001,6 +9005,13 @@ export class ClaudeAcpAgent {
       if (pending?.stopped || isReplayHiddenMetaMessage(message)) {
         return;
       }
+      const compactSummary = isCompactSummaryMessage(message);
+      // In full-chain mode the summary is model context, not user input. A client
+      // without the compaction contract must not get it as a user bubble; capable
+      // clients fall through to the compaction-update branch below.
+      if (fullChainReplay && compactSummary && !replayCompactionUpdates) {
+        return;
+      }
       // In the RFD form a child's history comes from its own transcript, so a
       // subagent message that the session transcript stores inline is skipped.
       if (rfdReplay && !child && parentToolUseIdOf(message)) return;
@@ -9111,7 +9122,7 @@ export class ClaudeAcpAgent {
       // text rather than vanishing behind a summary-less entity.
       if (
         replayCompactionUpdates &&
-        isCompactSummaryMessage(message) &&
+        compactSummary &&
         parentToolUseId === null &&
         typeof message.uuid === "string" &&
         message.uuid.length > 0
@@ -9124,7 +9135,11 @@ export class ClaudeAcpAgent {
             airClient: this.toolCallCapabilities.air.client,
           },
         );
-        if (replayCompaction.recordSummary(assistantMessageText(message.message))) {
+        const recorded = replayCompaction.recordSummary(assistantMessageText(message.message));
+        // In full-chain mode the summary came from the raw transcript, so even an
+        // unrecognized framing must not fall through to a huge user bubble: emit a
+        // summary-less completed entity and let the client show its fallback row.
+        if (recorded || fullChainReplay) {
           await replayCompaction.finish(message.uuid, "completed");
           return;
         }
@@ -11161,10 +11176,7 @@ export class ClaudeAcpAgent {
       // [CUSTOM] Append client-supplied custom models (`_meta.extraModels`) after
       // the allowlist so a client can offer arbitrary model ids (e.g. gateway
       // model names) without editing any settings file. See session-model.ts.
-      const modelsWithExtra = applyExtraModels(
-        allowedModels,
-        extraModelIdsFromMeta(params._meta),
-      );
+      const modelsWithExtra = applyExtraModels(allowedModels, extraModelIdsFromMeta(params._meta));
 
       const models = await getAvailableModels(
         q,

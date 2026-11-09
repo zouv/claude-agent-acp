@@ -2867,3 +2867,94 @@ describe("NativeSubagentRuntime child models", () => {
     expect(modelUpdates(published)).toEqual([]);
   });
 });
+
+describe("agent-map metadata", () => {
+  const launch = (toolCallId: string, input: Record<string, unknown>): AcpSessionNotification =>
+    ({
+      sessionId: "root",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: "Agent",
+        status: "pending",
+        rawInput: input,
+        _meta: { claudeCode: { toolName: "Agent" } },
+      },
+    }) as AcpSessionNotification;
+
+  const agentMap = (notification: AcpSessionNotification): Record<string, unknown> | undefined =>
+    (notification.update._meta as Record<string, Record<string, unknown>> | null | undefined)?.[
+      "vac/agentMap"
+    ];
+
+  async function runningChild(agentMapEnabled: boolean) {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      "rfd",
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+      undefined,
+      undefined,
+      undefined,
+      agentMapEnabled,
+    );
+    await runtime.route(
+      launch("launch-1", { description: "Fix the build", prompt: "Make it pass" }),
+      async () => {},
+    );
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+      async () => {},
+    );
+    return { runtime, published };
+  }
+
+  it("is absent unless the client asked for it", async () => {
+    const { runtime, published } = await runningChild(false);
+    await runtime.taskProgress("worker-1", { totalTokens: 10 });
+    expect(published.some((notification) => agentMap(notification) !== undefined)).toBe(false);
+  });
+
+  it("announces the launching call and the run's start time", async () => {
+    const { published } = await runningChild(true);
+    const announce = published.find(
+      (notification) => notification.update.sessionUpdate === "subagent_update",
+    );
+    expect(agentMap(announce!)).toMatchObject({
+      version: 1,
+      parentToolUseId: "launch-1",
+      startedAt: expect.any(Number),
+    });
+  });
+
+  it("merges task_progress usage and summary into the child's update", async () => {
+    const { runtime, published } = await runningChild(true);
+    await runtime.taskProgress("worker-1", {
+      totalTokens: 1200,
+      toolUses: 3,
+      durationMs: 4500,
+      summary: "Reading the build script",
+      lastToolName: "Read",
+    });
+    expect(agentMap(published.at(-1)!)).toMatchObject({
+      totalTokens: 1200,
+      toolUses: 3,
+      durationMs: 4500,
+      summary: "Reading the build script",
+      lastToolName: "Read",
+    });
+  });
+
+  it("stamps the end time when the run goes idle", async () => {
+    const { runtime, published } = await runningChild(true);
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+    const ended = published
+      .map((notification) => agentMap(notification))
+      .find((meta) => typeof meta?.endedAt === "number");
+    expect(ended).toBeDefined();
+  });
+});

@@ -148,6 +148,7 @@ import {
   clientSupportsAirCapability,
   withAirMeta,
 } from "./air-extension.js";
+import { clientSupportsAgentMap } from "./agent-map-meta.js";
 import * as sessionIndex from "./session-index/connection.js";
 import type {
   BatchGetSessionsRequest,
@@ -4766,6 +4767,7 @@ export class ClaudeAcpAgent {
       (agentId) => subagentLineage(params.sessionId, agentId, this.logger),
       (launchId) => subagentLaunchedBy(params.sessionId, launchId),
       this.subagentModels(params.sessionId),
+      clientSupportsAgentMap(this.clientCapabilities),
     ));
     // Adapter-composed advisories (hook feedback, model fallbacks) are live
     // events, not something the model said. Clients on the notice contract get
@@ -6764,6 +6766,15 @@ export class ClaudeAcpAgent {
                   last_tool_name: message.last_tool_name,
                   usage: message.usage,
                   tool_use_id: message.tool_use_id,
+                });
+                // The agent map's usage/summary ride on the child's own
+                // `subagent_update` (only for clients that asked for them).
+                await subagents.taskProgress(message.task_id, {
+                  totalTokens: message.usage?.total_tokens,
+                  toolUses: message.usage?.tool_uses,
+                  durationMs: message.usage?.duration_ms,
+                  summary: message.summary,
+                  lastToolName: message.last_tool_name,
                 });
                 break;
               case "task_started":

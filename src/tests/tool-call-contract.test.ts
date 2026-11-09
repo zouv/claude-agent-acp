@@ -2,13 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { AcpClient, toAcpNotifications, ToolUseCache } from "../acp-agent.js";
 import { ClientCapabilities as ToolCallCapabilities } from "../tool-calls/client-capabilities.js";
 import { backgroundedBashToolCall, withRunningTerminal } from "../tool-calls/background.js";
 import { ChangedMetaFilter } from "../tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
-import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
+import { AcpToolCallRenderer, mcpToolName } from "../tool-calls/renderer.js";
 import { changedTaskPlanEntries, createTaskHook, type TaskState } from "../tools.js";
 
 const logger = { log: () => {}, error: () => {} };
@@ -337,6 +337,16 @@ describe("the ACP tool call contract", () => {
     expect(report(terminalAir, "Agent", input).call.title).toBe("Explore (high effort)");
   });
 
+  it("does not show an effort for a fork, which runs at the parent's effort", () => {
+    const input = {
+      description: "Explore",
+      prompt: "Inspect",
+      effort: "high",
+      subagent_type: "fork",
+    };
+    expect(report(terminalAir, "Agent", input).call.title).toBe("Explore");
+  });
+
   it("reports TodoWrite as a plan, not as a tool call", () => {
     const { call } = report(terminalAir, "TodoWrite", {
       todos: [{ content: "Test", status: "pending", activeForm: "Testing" }],
@@ -563,6 +573,30 @@ describe("the ACP tool call contract", () => {
     expect(updates[0]).not.toHaveProperty("rawOutput");
   });
 
+  /** An AIR client gets the MCP server and tool under jetbrains.air.mcp; other clients do not. */
+  it("sends the MCP server and tool under jetbrains.air.mcp for AIR only", () => {
+    const { call } = report(terminalAir, "mcp__docs__search", { q: "x" });
+    expect(call._meta).toEqual({
+      claudeCode: { toolName: "mcp__docs__search" },
+      jetbrains: { air: { version: 1, mcp: { server: "docs", tool: "search" } } },
+      is_mcp_tool_call: true,
+    });
+    const plain = report({}, "mcp__docs__search", { q: "x" });
+    expect(plain.call._meta).toEqual({ claudeCode: { toolName: "mcp__docs__search" } });
+  });
+
+  /** A refinement that carries jetbrains.air.mcp again loses it once the tool_call sent it. */
+  it("does not repeat jetbrains.air.mcp on the tool_call_update", () => {
+    const renderer = AcpToolCallRenderer.for(terminalAir);
+    const toolUse = { id: "t", name: "mcp__docs__search", input: { q: "x" } };
+    const filter = new ChangedMetaFilter();
+    filter.apply(renderer.toolCall(toolUse, { cwd: "/work" }) as any);
+    const refinement = renderer.refinement(toolUse, "/work");
+    expect((refinement._meta as any).jetbrains.air.mcp).toEqual({ server: "docs", tool: "search" });
+    const update = filter.apply(refinement as any) as any;
+    expect(update?._meta?.jetbrains).toBeUndefined();
+  });
+
   it.each(["TaskOutput", "TaskStop"])("reports %s through the generic reporter", (name) => {
     const { call, updates } = report(terminalAir, name, { task_id: "b1" }, { content: "done" });
     expect(call).toMatchObject({ title: name, kind: "other", content: [] });
@@ -636,6 +670,25 @@ describe("tool call reports outside the tool_use stream", () => {
       elapsedTimeSeconds: 2,
       subagentType: "Explore",
     });
+  });
+});
+
+describe("mcpToolName", () => {
+  /** Splits at the first separator after the prefix; the tool keeps any later separator. */
+  it.each([
+    ["mcp__docs__search", { server: "docs", tool: "search" }],
+    [
+      "mcp__plugin_documents_docs__doc_export",
+      { server: "plugin_documents_docs", tool: "doc_export" },
+    ],
+    ["mcp__srv__a__b", { server: "srv", tool: "a__b" }],
+  ])("parses %s", (name, expected) => {
+    expect(mcpToolName(name)).toEqual(expected);
+  });
+
+  /** Names that are not a complete mcp__server__tool name give no result. */
+  it.each(["mcp__x", "mcp____tool", "mcp__srv__", "Bash"])("rejects %s", (name) => {
+    expect(mcpToolName(name)).toBeUndefined();
   });
 });
 

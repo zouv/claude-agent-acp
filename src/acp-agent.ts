@@ -4979,6 +4979,11 @@ export class ClaudeAcpAgent {
 
     // ACP's usage_update has no model field, so the model the usage belongs
     // to rides in `_meta` alongside the other `_claude/*` keys.
+    //
+    // `_claude/usage` carries the same snapshot `used` is summed from, so a
+    // client can split the context ring into prompt vs output instead of
+    // showing one flat number. Absent after a compaction, where the adapter
+    // only knows the post-compaction total (`lastAssistantUsage` is null).
     const attachUsageModel = <
       T extends {
         sessionUpdate: "usage_update";
@@ -4989,14 +4994,19 @@ export class ClaudeAcpAgent {
     >(
       update: T,
     ): T => {
-      if (!lastAssistantModel) return update;
-      return {
-        ...update,
-        _meta: {
-          ...(update._meta ?? {}),
-          "_claude/model": lastAssistantModel,
-        },
-      };
+      const usage = lastAssistantUsage;
+      const meta: Record<string, unknown> = { ...(update._meta ?? {}) };
+      if (lastAssistantModel) meta["_claude/model"] = lastAssistantModel;
+      if (usage && totalTokens(usage) > 0) {
+        meta["_claude/usage"] = {
+          inputTokens: usage.input_tokens,
+          outputTokens: usage.output_tokens,
+          cachedReadTokens: usage.cache_read_input_tokens,
+          cachedWriteTokens: usage.cache_creation_input_tokens,
+        };
+      }
+      if (Object.keys(meta).length === 0) return update;
+      return { ...update, _meta: meta };
     };
 
     const internalErrorForClient = (data: unknown, rawDetail?: string) =>

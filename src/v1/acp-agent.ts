@@ -149,6 +149,7 @@ import {
   clientSupportsAirCapability,
   withAirMeta,
 } from "../air-extension.js";
+import { clientSupportsAgentMap } from "../agent-map-meta.js";
 import * as sessionIndex from "./session-index.js";
 import type {
   BatchGetSessionsRequest,
@@ -369,6 +370,8 @@ import {
 import {
   aliasResumedModelRow,
   applyAvailableModelsAllowlist,
+  applyExtraModels,
+  extraModelIdsFromMeta,
   getAvailableModels,
   MODEL_CONFIG_ID,
   modelDisplayName,
@@ -3241,6 +3244,7 @@ export class ClaudeAcpAgent {
       (agentId) => subagentLineage(params.sessionId, agentId, this.logger),
       (launchId) => subagentLaunchedBy(params.sessionId, launchId),
       this.subagentModels(params.sessionId),
+      clientSupportsAgentMap(this.clientCapabilities),
     ));
     // Adapter-composed advisories (hook feedback, model fallbacks) are live
     // events, not something the model said. Clients on the notice contract get
@@ -3470,21 +3474,26 @@ export class ClaudeAcpAgent {
     >(
       update: T,
     ): T => {
+      let meta: Record<string, unknown> = { ...(update._meta ?? {}) };
       if (pendingRateLimit !== null) {
-        update = {
-          ...update,
-          _meta: { "_claude/rateLimit": pendingRateLimit, ...(update._meta ?? {}) },
-        };
+        meta = { "_claude/rateLimit": pendingRateLimit, ...meta };
         pendingRateLimit = null;
       }
-      if (!lastAssistantModel) return update;
-      return {
-        ...update,
-        _meta: {
-          ...(update._meta ?? {}),
-          "_claude/model": lastAssistantModel,
-        },
-      };
+      if (lastAssistantModel) meta["_claude/model"] = lastAssistantModel;
+      // The same snapshot `used` is summed from, so a client can split the
+      // context ring into prompt vs output instead of one flat number.
+      // Absent after a compaction, where only the post-compaction total is known.
+      const usage = lastAssistantUsage;
+      if (usage && totalTokens(usage) > 0) {
+        meta["_claude/usage"] = {
+          inputTokens: usage.input_tokens,
+          outputTokens: usage.output_tokens,
+          cachedReadTokens: usage.cache_read_input_tokens,
+          cachedWriteTokens: usage.cache_creation_input_tokens,
+        };
+      }
+      if (Object.keys(meta).length === 0) return update;
+      return { ...update, _meta: meta };
     };
 
     const internalErrorForClient = (data: unknown, rawDetail?: string) =>
@@ -5270,6 +5279,15 @@ export class ClaudeAcpAgent {
                   last_tool_name: message.last_tool_name,
                   usage: message.usage,
                   tool_use_id: message.tool_use_id,
+                });
+                // The agent map's usage/summary ride on the child's own
+                // `subagent_update` (only for clients that asked for them).
+                await subagents.taskProgress(message.task_id, {
+                  totalTokens: message.usage?.total_tokens,
+                  toolUses: message.usage?.tool_uses,
+                  durationMs: message.usage?.duration_ms,
+                  summary: message.summary,
+                  lastToolName: message.last_tool_name,
                 });
                 break;
               case "task_started":
@@ -10523,9 +10541,13 @@ export class ClaudeAcpAgent {
           )
         : settingsAllowedModels;
 
+      const modelsWithExtra = applyExtraModels(
+        allowedModels,
+        extraModelIdsFromMeta(params._meta),
+      );
       const models = await getAvailableModels(
         q,
-        allowedModels,
+        modelsWithExtra,
         initializationResult.models,
         settingsManager,
         this.logger,

@@ -7,6 +7,7 @@ import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
+import { agentMapMeta } from "./agent-map-meta.js";
 import { orderedConfigOptions } from "./session-config-options.js";
 import { MODEL_CONFIG_ID } from "./session-model.js";
 import { isFinalToolCallStatus } from "./tool-calls/renderer.js";
@@ -65,6 +66,16 @@ export type NativeSubagent = {
    */
   reportedCwd?: string | null;
   terminalState?: SubagentState;
+  /** Agent-map metadata (see agent-map-meta.ts): when this run started. */
+  startedAt?: number;
+  /** Agent-map metadata: when this run went `idle`. */
+  endedAt?: number;
+  /** Agent-map metadata: the SDK's usage for this run (`task_progress`). */
+  usage?: { totalTokens?: number; toolUses?: number; durationMs?: number };
+  /** Agent-map metadata: the SDK's one-line progress summary. */
+  summary?: string;
+  /** Agent-map metadata: the child's most recent tool name. */
+  lastToolName?: string;
   /** Connection-local single-flight state; never serialized on the wire. */
   announcePromise?: Promise<void>;
   /** Connection-local: serializes the child's `cwd` reports; never serialized on the wire. */
@@ -269,6 +280,8 @@ export class NativeSubagentRuntime {
     private readonly lineage?: SubagentLineage,
     private readonly launchedAgent?: LaunchedAgent,
     private readonly models?: SubagentModels,
+    /** The client asked for `_meta["vac/agentMap"]` on its subagent updates. */
+    private readonly agentMap = false,
   ) {
     this.form = form;
     this.enabled = form !== undefined;
@@ -1221,6 +1234,12 @@ export class NativeSubagentRuntime {
       child.parentToolUseId = toolUseId;
     }
     if (!isWorking(child)) {
+      // A resumed child keeps its id but starts a new run: the map's clock and
+      // usage describe this run, not the whole life of the agent.
+      child.startedAt = Date.now();
+      child.endedAt = undefined;
+      child.usage = undefined;
+      child.summary = undefined;
       await this.reportState(child, {
         state: child.openRequests ? "requires_action" : "running",
       });
@@ -1280,7 +1299,7 @@ export class NativeSubagentRuntime {
     if (!this.form) return;
     const cwd =
       this.form === "rfd" && !child.announced ? await this.unreportedCwd(child) : undefined;
-    await announceNativeSubagent(child, this.publish, this.form, cwd ?? undefined);
+    await announceNativeSubagent(child, this.publish, this.form, cwd ?? undefined, this.agentMap);
     // A hook that reported a `cwd` while the announcement was being built.
     await this.publishCwd(child);
     await this.publishConfiguration(child);
@@ -1297,6 +1316,10 @@ export class NativeSubagentRuntime {
   ): Promise<void> {
     child.workState = state.state;
     child.missingError = false;
+    // The RFD's `idle` is the end of this run (the child stays reusable), so
+    // that is where the map's clock stops.
+    if (state.state === "idle" && child.endedAt === undefined) child.endedAt = Date.now();
+    const meta = this.agentMapMeta(child);
     await this.publish({
       sessionId: child.parentSessionId,
       update: {
@@ -1304,7 +1327,56 @@ export class NativeSubagentRuntime {
         sessionId: child.sessionId,
         ...capabilities,
         state,
+        ...(meta ? { _meta: meta } : {}),
       },
+    });
+  }
+
+  /** The agent-map `_meta` of `child`, or undefined when the client did not ask for it. */
+  private agentMapMeta(child: NativeSubagent) {
+    if (!this.agentMap || this.form !== "rfd") return undefined;
+    return agentMapMeta({
+      parentToolUseId: child.parentToolUseId,
+      startedAt: child.startedAt,
+      endedAt: child.endedAt,
+      durationMs: child.usage?.durationMs,
+      totalTokens: child.usage?.totalTokens,
+      toolUses: child.usage?.toolUses,
+      summary: child.summary,
+      lastToolName: child.lastToolName,
+    });
+  }
+
+  /**
+   * The RFD form: the SDK's `task_progress` for a running child. Publishes a
+   * `subagent_update` that merges the new usage/summary into the client's
+   * copy (no labels or state are repeated).
+   */
+  async taskProgress(
+    taskId: string,
+    progress: {
+      totalTokens?: number;
+      toolUses?: number;
+      durationMs?: number;
+      summary?: string;
+      lastToolName?: string;
+    },
+  ): Promise<void> {
+    if (!this.agentMap || this.form !== "rfd") return;
+    const child = this.children.get(taskId);
+    if (!child?.announced) return;
+    const usage = child.usage ?? {};
+    if (progress.totalTokens !== undefined) usage.totalTokens = progress.totalTokens;
+    if (progress.toolUses !== undefined) usage.toolUses = progress.toolUses;
+    if (progress.durationMs !== undefined) usage.durationMs = progress.durationMs;
+    child.usage = usage;
+    if (progress.summary !== undefined) child.summary = progress.summary;
+    if (progress.lastToolName !== undefined) child.lastToolName = progress.lastToolName;
+    const meta = this.agentMapMeta(child);
+    if (!meta) return;
+    await this.publish({
+      sessionId: child.parentSessionId,
+      update: { sessionUpdate: "subagent_update", sessionId: child.sessionId, _meta: meta },
     });
   }
 
@@ -1706,6 +1778,9 @@ export class NativeSubagentRuntime {
     const child: NativeSubagent = {
       sessionId: this.nextChildSessionId(taskId, previous, restored),
       ...fields,
+      // A restored generation ran before this process started: its start time
+      // is unknown, and inventing one would make the agent map lie.
+      ...(restored ? {} : { startedAt: Date.now() }),
     };
     const toolUseId = child.parentToolUseId;
     this.children.set(taskId, child);
@@ -1804,12 +1879,16 @@ export async function announceNativeSubagent(
   publish: Publish,
   form: SubagentForm,
   cwd?: string,
+  agentMap = false,
 ): Promise<void> {
   if (child.announced) return;
   if (child.announcePromise) return child.announcePromise;
   const announce = Promise.resolve().then(async () => {
     if (form === "rfd") {
       child.workState = "running";
+      const announceMeta = agentMap
+        ? agentMapMeta({ parentToolUseId: child.parentToolUseId, startedAt: child.startedAt })
+        : undefined;
       await publish({
         sessionId: child.parentSessionId,
         update: {
@@ -1820,6 +1899,7 @@ export async function announceNativeSubagent(
           ...(cwd ? { cwd } : {}),
           capabilities: { cancel: {} },
           state: { state: "running" },
+          ...(agentMap && announceMeta ? { _meta: announceMeta } : {}),
         },
       });
       if (cwd) child.reportedCwd = cwd;

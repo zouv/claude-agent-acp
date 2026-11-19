@@ -2,6 +2,7 @@ import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { NewSessionRequest } from "@agentclientprotocol/sdk/unstable";
 
 import type { NewSessionMeta } from "../new-session-meta.js";
+import { extraModelIdsFromMeta } from "../session-model.js";
 
 /** Normalize skills without changing their SDK semantics. Array order and
  *  duplicates do not affect the selected skill set, so neither should rebuild
@@ -142,6 +143,7 @@ export function computeSessionFingerprint(params: {
       clientSystemPrompt: params.systemPrompt ?? undefined,
       disableBuiltInTools: meta?.disableBuiltInTools,
       emitRawSDKMessages: meta?.claudeCode?.emitRawSDKMessages,
+      extraModels: extraModelIdsFromMeta(meta),
       options,
     }),
   );

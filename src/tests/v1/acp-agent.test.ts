@@ -19939,6 +19939,12 @@ describe("result origin handling", () => {
     expect(usageUpdate.update._meta).toEqual({
       "_claude/origin": { kind: "channel", server: "acp" },
       "_claude/model": "claude-sonnet-4-6",
+      "_claude/usage": {
+        inputTokens: 10,
+        outputTokens: 5,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
     });
   });
 
@@ -19954,7 +19960,15 @@ describe("result origin handling", () => {
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdate).toBeDefined();
-    expect(usageUpdate.update._meta).toEqual({ "_claude/model": "claude-sonnet-4-6" });
+    expect(usageUpdate.update._meta).toEqual({
+      "_claude/model": "claude-sonnet-4-6",
+      "_claude/usage": {
+        inputTokens: 10,
+        outputTokens: 5,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+    });
   });
 
   it("task-notification result with max_tokens does not override the user-turn stopReason", async () => {
